@@ -1,0 +1,11 @@
+{
+  "server_url": "http://127.0.0.1:8765",
+  "node_id": "command_module",
+  "state_dir": "../runtime/command_module",
+  "steps": [{
+    "step_id": "existing_script_step", "name": "现有脚本接入示例", "order": 40,
+    "cwd": "..",
+    "command": ["{python}", "examples/legacy_script.py", "--seconds", "1"],
+    "params": {}, "timeout_seconds": 60
+  }]
+}

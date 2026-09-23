@@ -1,0 +1,11 @@
+{
+  "server_url": "http://127.0.0.1:8765",
+  "node_id": "demo_c",
+  "state_dir": "../runtime/demo_c",
+  "poll_seconds": 0.3,
+  "steps": [{
+    "step_id": "demo_step_c", "name": "模拟步骤 C", "order": 30,
+    "function": "../examples/demo_task.py:execute",
+    "params": {"seconds": 1, "message": "C 完成"}, "timeout_seconds": 30
+  }]
+}

@@ -1,0 +1,14 @@
+{
+  "server_url": "http://127.0.0.1:8765",
+  "node_id": "replace_with_unique_module_name",
+  "state_dir": "../runtime/my_module",
+  "poll_seconds": 1,
+  "steps": [{
+    "step_id": "replace_with_unique_step_name",
+    "name": "负责人填写任务名称",
+    "order": 10,
+    "function": "../examples/my_task.py:execute",
+    "params": {},
+    "timeout_seconds": 600
+  }]
+}

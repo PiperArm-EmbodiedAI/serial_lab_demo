@@ -1,0 +1,1 @@
+# No third-party packages required. Python >= 3.9 with sqlite3 is sufficient.

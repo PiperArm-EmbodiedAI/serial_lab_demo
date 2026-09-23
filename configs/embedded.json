@@ -1,0 +1,9 @@
+{
+  "server_url": "http://127.0.0.1:8765",
+  "node_id": "embedded_module",
+  "state_dir": "../runtime/embedded_module",
+  "steps": [{
+    "step_id": "embedded_step", "name": "常驻进程接入示例", "order": 50,
+    "handler": "existing_action", "params": {}, "timeout_seconds": 60
+  }]
+}

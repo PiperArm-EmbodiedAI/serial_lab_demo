@@ -1,0 +1,18 @@
+{
+  "server_url": "http://127.0.0.1:8765",
+  "node_id": "test_component",
+  "state_dir": "../runtime/test_component",
+  "steps": [
+    {
+      "step_id": "add_numbers",
+      "name": "求和测试",
+      "order": 40,
+      "function": "../examples/test_component.py:execute",
+      "params": {
+        "a": 2,
+        "b": 3
+      },
+      "timeout_seconds": 30
+    }
+  ]
+}
