@@ -33,12 +33,12 @@ class HttpTests(unittest.TestCase):
     def test_ui_is_served_and_control_routes_work(self):
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(self.url + "/") as response:
-            self.assertIn("Run selected steps", response.read().decode("utf-8"))
+            self.assertIn("运行所选步骤", response.read().decode("utf-8"))
         identity = {"node_id": "a", "instance_id": "a1", "busy": False}
         self.client.call("POST", "/api/register", dict(identity, config_hash=digest("a"),
             steps=[{"step_id": "a_step", "order": 10}]))
         plan = self.client.call("GET", "/api/plan")
-        self.assertIn("Test step", opener.open(self.url + "/").read().decode("utf-8"))
+        self.assertIn("单步测试", opener.open(self.url + "/").read().decode("utf-8"))
         run = self.client.call("POST", "/api/runs", {"plan_version": plan["plan_version"],
             "step_ids": ["a_step"], "mode": "single"})
         path = "/api/runs/" + run["run_id"]
