@@ -6,10 +6,10 @@ import uuid
 from .common import JsonStore, digest, dumps, require
 
 
-ACTIVE = {"running", "pausing", "paused", "blocked"}
+ACTIVE = {"running", "pausing", "paused", "stopping", "blocked"}
 FINISHED = {"succeeded", "failed"}
 COMPLETED_TASKS = {"succeeded", "skipped"}
-STATE_VERSION = 2
+STATE_VERSION = 3
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 
 
@@ -199,15 +199,36 @@ class Coordinator:
             state["runs"].append(run)
         return run
 
+    def _task_payload(self, run, task, cancel_requested=False):
+        return {"run_id": run["run_id"], "task_id": task["task_id"],
+                "step_id": task["step"]["step_id"], "params": task["step"]["params"],
+                "config_hash": task["step"]["config_hash"], "deadline": task["deadline"],
+                "expires_in_seconds": max(0, task["deadline"] - self.clock()),
+                "cancel_requested": cancel_requested,
+                "previous_results": {t["step"]["step_id"]: t["result"] for t in run["tasks"]
+                                     if t["status"] == "succeeded" and t["result"] is not None}}
+
     def poll(self, body):
         with self.store.edit() as state:
             node = self._identity(state, body)
             node["last_seen"] = self.clock()
             node["busy"] = bool(body.get("busy"))
             run = self._active(state)
-            if not run or run["status"] == "blocked":
-                return {"task": None, "run_status": run["status"] if run else "idle"}
+            if not run:
+                return {"task": None, "run_status": "idle"}
             task = self._current(run)
+            if run["status"] == "blocked":
+                if (task and task.get("cancel_requested")
+                        and task["step"]["node_id"] == body["node_id"]
+                        and task.get("instance_id") == body["instance_id"]):
+                    return {"task": self._task_payload(run, task, cancel_requested=True),
+                            "run_status": run["status"]}
+                return {"task": None, "run_status": run["status"]}
+            if run["status"] == "stopping" and task is not None:
+                if task["step"]["node_id"] == body["node_id"] and task.get("instance_id") == body["instance_id"]:
+                    return {"task": self._task_payload(run, task, cancel_requested=True),
+                            "run_status": run["status"]}
+                return {"task": None, "run_status": run["status"]}
             if task is None or task["step"]["node_id"] != body["node_id"]:
                 return {"task": None, "run_status": run["status"]}
             if task["status"] == "pending":
@@ -221,12 +242,7 @@ class Coordinator:
             if task["instance_id"] != body["instance_id"]:
                 return {"task": None, "run_status": run["status"]}
             # Re-delivery has the same task_id, including when a poll response is lost.
-            return {"task": {"run_id": run["run_id"], "task_id": task["task_id"],
-                    "step_id": task["step"]["step_id"], "params": task["step"]["params"],
-                    "config_hash": task["step"]["config_hash"], "deadline": task["deadline"],
-                    "expires_in_seconds": max(0, task["deadline"] - self.clock()),
-                    "previous_results": {t["step"]["step_id"]: t["result"] for t in run["tasks"]
-                                         if t["status"] == "succeeded"}}, "run_status": run["status"]}
+            return {"task": self._task_payload(run, task), "run_status": run["status"]}
 
     def event(self, body):
         require(valid_id(body.get("event_id")), "invalid event_id")
@@ -245,7 +261,13 @@ class Coordinator:
             require(task["step"]["node_id"] == body.get("node_id"), "task belongs to another node", 403)
             require(task["status"] != "pending", "task was never assigned", 409)
             status = body["status"]
-            if task["status"] in FINISHED:
+            if run["status"] in {"blocked", "closed"}:
+                task.setdefault("late_events", []).append({"status": status, "result": body.get("result"),
+                    "error": body.get("error"), "received_at": self.clock()})
+            elif task.get("operator_resolution"):
+                task.setdefault("late_events", []).append({"status": status, "result": body.get("result"),
+                    "error": body.get("error"), "received_at": self.clock()})
+            elif task["status"] in FINISHED:
                 # Stale running/unknown events cannot regress a terminal task.
                 require(status not in FINISHED or (status == task["status"]
                         and body.get("result") == task["result"] and body.get("error") == task["error"]),
@@ -257,13 +279,14 @@ class Coordinator:
             else:
                 task.update(status=status, result=body.get("result"), error=body.get("error"),
                             finished_at=self.clock())
-                if run["status"] in {"running", "pausing", "paused"}:
+                if run["status"] in {"running", "pausing", "paused", "stopping"}:
                     if status in {"failed", "unknown"}:
                         self._block(run, status + ": " + task["step"]["step_id"])
                     elif all(t["status"] in COMPLETED_TASKS for t in run["tasks"]):
                         run.update(status="succeeded", finished_at=self.clock())
-                    elif run["status"] == "pausing":
+                    elif run["status"] in {"pausing", "stopping"}:
                         run["status"] = "paused"
+                        run["reason"] = "operator_requested_stop_completed: " + task["step"]["step_id"]
                 # A late success is recorded, but never resumes a blocked/closed run.
             state["events"][body["event_id"]] = digest(canonical)
         return {"ok": True, "duplicate": False}
@@ -284,6 +307,47 @@ class Coordinator:
             elif action == "resume":
                 require(run["status"] == "paused", "only a manually paused run can resume", 409)
                 run["status"] = "running"
+            elif action == "stop-current":
+                require(run["status"] in {"running", "blocked"},
+                        "only a running or blocked run can request a stop", 409)
+                current = self._current(run)
+                require(current is not None and current["status"] in {"assigned", "running", "unknown"},
+                        "there is no active or unresolved task to stop", 409)
+                require(not current.get("cancel_requested"), "stop already requested", 409)
+                require(str(body.get("note", "")).strip(), "stop request requires a reason")
+                current["cancel_requested"] = True
+                current["stop_note"] = str(body["note"]).strip()
+                current["cancel_requested_at"] = self.clock()
+                if current["status"] in {"assigned", "running"}:
+                    run.update(status="stopping", reason="operator_requested_stop: " + current["step"]["step_id"])
+            elif action in {"operator-complete", "skip-current"}:
+                require(run["status"] in {"blocked", "paused"},
+                        "run must be blocked or paused before manual resolution", 409)
+                current = self._current(run)
+                require(current is not None, "there is no unresolved task", 409)
+                require(current["status"] in {"failed", "unknown"},
+                        "only a failed or unknown task can be manually resolved", 409)
+                require(body.get("physical_checked") is True and str(body.get("note", "")).strip(),
+                        "manual resolution requires physical_checked=true and an inspection note")
+                original_status = current["status"]
+                resolution = {"action": action, "note": str(body["note"]).strip(),
+                              "physical_checked": True, "resolved_at": self.clock(),
+                              "original_status": original_status}
+                if action == "operator-complete":
+                    result = body.get("result")
+                    require(result is None or isinstance(result, dict), "result must be a JSON object")
+                    require(len(dumps(result).encode("utf-8")) <= 65536, "result is limited to 64 KiB")
+                    current.update(status="succeeded", result=result)
+                    resolution["result_provided"] = result is not None
+                else:
+                    current.update(status="skipped", result=None)
+                current["operator_resolution"] = resolution
+                current["error"] = current.get("error")
+                run["reason"] = ""
+                if all(t["status"] in COMPLETED_TASKS for t in run["tasks"]):
+                    run.update(status="succeeded", finished_at=self.clock())
+                else:
+                    run["status"] = "running"
             elif action == "close":
                 require(run["status"] in ACTIVE, "run is already finished", 409)
                 require(body.get("physical_checked") is True and str(body.get("note", "")).strip(),

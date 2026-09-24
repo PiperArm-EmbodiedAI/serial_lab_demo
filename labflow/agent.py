@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import threading
@@ -37,6 +38,11 @@ class Agent:
         self.client = Client(self.config["server_url"])
         self.stop = threading.Event()
         self.thread = None
+        self.task_lock = threading.Lock()
+        self.current_task_id = None
+        self.current_process = None
+        self.cancel_requested = threading.Event()
+        self.cancel_signal_sent = False
         with self.store.edit() as state:
             for local in state["tasks"].values():
                 if local["status"] == "running":
@@ -70,6 +76,26 @@ class Agent:
             with self.store.edit() as state:
                 state["outbox"] = [e for e in state["outbox"] if e["event_id"] != event["event_id"]]
 
+    def request_cancel(self, task_id):
+        with self.task_lock:
+            if self.current_task_id != task_id:
+                return False
+            if self.cancel_requested.is_set():
+                return True
+            self.cancel_requested.set()
+            process = self.current_process
+            if process is None or process.poll() is not None:
+                return True
+            try:
+                if os.name == "nt":
+                    process.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    os.killpg(process.pid, signal.SIGINT)
+                self.cancel_signal_sent = True
+            except (OSError, ProcessLookupError, AttributeError, ValueError):
+                return False
+            return True
+
     def accept(self, task):
         if task["config_hash"] != self.config_hash:
             raise RuntimeError("Received a task for a different local configuration")
@@ -78,9 +104,20 @@ class Agent:
                 return  # Same task ID must never execute again, across restarts too.
             if any(t["status"] in {"running", "unknown"} for t in state["tasks"].values()):
                 return
+            if task.get("cancel_requested"):
+                error = "Cancellation requested before local execution; inspect hardware before recovery"
+                state["tasks"][task["task_id"]] = {"task": task, "status": "failed", "error": error}
+                self._queue(state, task, "failed", error=error)
+                print(f"[{self.node_id}] CANCELLED before start {task['step_id']}", flush=True)
+                return
             state["tasks"][task["task_id"]] = {"task": task, "status": "running"}
             self._queue(state, task, "running")
         # Journal commit precedes any user code or subprocess launch.
+        with self.task_lock:
+            self.current_task_id = task["task_id"]
+            self.current_process = None
+            self.cancel_requested.clear()
+            self.cancel_signal_sent = False
         valid_until = time.monotonic() + task["expires_in_seconds"]
         self.thread = threading.Thread(target=self._execute, args=(task, valid_until), name="business-task", daemon=False)
         self.thread.start()
@@ -122,13 +159,24 @@ class Agent:
                             "LABFLOW_TASK_ID": task["task_id"], "LABFLOW_RUN_ID": task["run_id"],
                             "LABFLOW_STEP_ID": task["step_id"], "PYTHONUNBUFFERED": "1"})
                 with open(folder / "stdout.log", "wb") as log:
-                    # No shell interpolation, and no automatic kill/retry on a hardware timeout.
+                    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
                     process = subprocess.Popen(argv, cwd=str(cwd), env=env, stdout=log, stderr=subprocess.STDOUT,
-                                               start_new_session=(os.name != "nt"))
+                                               start_new_session=(os.name != "nt"), creationflags=creationflags)
+                    with self.task_lock:
+                        self.current_process = process
+                        already_cancelled = self.cancel_requested.is_set()
+                    if already_cancelled:
+                        self.request_cancel(task["task_id"])
                     exit_code = process.wait()
+                    with self.task_lock:
+                        self.current_process = None
+                if self.cancel_requested.is_set():
+                    raise RuntimeError("Cancellation requested; inspect hardware before recovery")
                 if exit_code != 0:
                     raise RuntimeError(f"Process exited with code {exit_code}; see {folder / 'stdout.log'}")
                 result = self._validate_result(read_json(result_file) if result_file.exists() else {"exit_code": 0})
+            if self.cancel_requested.is_set():
+                raise RuntimeError("Cancellation requested; inspect hardware before recovery")
             status = "succeeded"
         except BaseException as exc:
             error = f"{type(exc).__name__}: {exc}"[:4000]
@@ -136,6 +184,11 @@ class Agent:
             with self.store.edit() as state:
                 state["tasks"][task["task_id"]].update(status=status, result=result, error=error)
                 self._queue(state, task, status, result, error)
+            with self.task_lock:
+                self.current_task_id = None
+                self.current_process = None
+                self.cancel_requested.clear()
+                self.cancel_signal_sent = False
             print(f"[{self.node_id}] {status.upper()} {task['step_id']}" + (f" {error}" if error else ""), flush=True)
 
     def serve(self):
@@ -152,8 +205,11 @@ class Agent:
                         print(f"[{self.node_id}] registered {len(self.steps)} step(s)", flush=True)
                     self.flush()
                     response = self.client.call("POST", "/api/poll", self.identity())
-                    if response.get("task"):
-                        self.accept(response["task"])
+                    task = response.get("task")
+                    if task and task.get("cancel_requested"):
+                        self.request_cancel(task["task_id"])
+                    if task:
+                        self.accept(task)
                     last_message = ""
                 except Exception as exc:
                     if isinstance(exc, ApiError) and exc.status in {404, 409}:

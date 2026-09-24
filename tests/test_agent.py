@@ -111,6 +111,31 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(record["status"], "succeeded")
         self.assertEqual(record["result"], {"exit_code": 0})
 
+    def test_stop_request_interrupts_subprocess_but_never_reports_success(self):
+        import os
+        import sys
+        script = self.root / "interruptible.py"
+        script.write_text(
+            "import signal, time\\nsignal.signal(signal.SIGINT, lambda *_: exit(0))\\n"
+            "print('ready', flush=True)\\ntime.sleep(30)\\n", encoding="utf-8")
+        self.agent.steps["step"] = {"command": ["{python}", str(script)]}
+        task = self.task()
+        self.agent.accept(task)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with self.agent.task_lock:
+                process = self.agent.current_process
+            if process is not None:
+                break
+            time.sleep(0.01)
+        self.assertIsNotNone(process)
+        self.assertTrue(self.agent.request_cancel(task["task_id"]))
+        self.agent.thread.join(5)
+        self.assertFalse(self.agent.thread.is_alive())
+        record = self.agent.store.read()["tasks"][task["task_id"]]
+        self.assertEqual(record["status"], "failed")
+        self.assertIn("Cancellation requested", record["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

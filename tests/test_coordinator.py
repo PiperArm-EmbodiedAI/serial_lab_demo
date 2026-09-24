@@ -152,6 +152,50 @@ class CoordinatorTests(unittest.TestCase):
         with self.assertRaises(ApiError):
             self.server.control(run["run_id"], "resume", {})
 
+    def test_stop_request_is_delivered_then_operator_can_mark_done(self):
+        self.nodes()
+        run = self.start()
+        task = self.poll("a")
+        self.server.control(run["run_id"], "stop-current", {"note": "operator requested stop"})
+        delivered = self.server.poll({"node_id": "a", "instance_id": "instance_a", "busy": True})
+        self.assertTrue(delivered["task"]["cancel_requested"])
+        self.assertEqual(self.server.poll({"node_id": "b", "instance_id": "instance_b", "busy": False})["task"], None)
+        failed = self.event_body(task, "a", "failed", result=None)
+        failed["error"] = "Cancellation requested"
+        self.server.event(failed)
+        with self.assertRaises(ApiError):
+            self.server.control(run["run_id"], "operator-complete", {"note": "checked"})
+        self.server.control(run["run_id"], "operator-complete", {
+            "physical_checked": True, "note": "completed manually", "result": {"ok": True}})
+        next_task = self.poll("b")
+        self.assertEqual(next_task["previous_results"], {"step_a": {"ok": True}})
+        self.assertEqual(self.server.status(run["run_id"])["tasks"][0]["operator_resolution"]["original_status"], "failed")
+
+    def test_operator_skip_requires_inspection_and_does_not_supply_result(self):
+        self.nodes()
+        run = self.start()
+        task = self.poll("a")
+        self.server.event(self.event_body(task, "a", "failed"))
+        with self.assertRaises(ApiError):
+            self.server.control(run["run_id"], "skip-current", {"physical_checked": True, "note": ""})
+        self.server.control(run["run_id"], "skip-current", {
+            "physical_checked": True, "note": "cleared and intentionally skipped"})
+        self.assertEqual(self.poll("b")["previous_results"], {})
+        self.assertEqual(self.server.status(run["run_id"])["tasks"][0]["status"], "skipped")
+
+    def test_late_event_does_not_override_operator_resolution(self):
+        self.nodes()
+        run = self.start()
+        task = self.poll("a")
+        self.server.event(self.event_body(task, "a", "failed"))
+        self.server.control(run["run_id"], "operator-complete", {
+            "physical_checked": True, "note": "manually verified"})
+        self.server.event(self.event_body(task, "a", "succeeded", {"late": True}))
+        saved = self.server.status(run["run_id"])["tasks"][0]
+        self.assertEqual(saved["status"], "succeeded")
+        self.assertEqual(saved["result"], None)
+        self.assertEqual(len(saved["late_events"]), 1)
+
     def test_timeout_and_late_success_do_not_resume(self):
         self.server.register(self.registration("a", 10, timeout=1))
         self.server.register(self.registration("b", 20))
@@ -245,7 +289,7 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(status["tasks"][0]["status"], "unknown")
         self.assertEqual(status["mode"], "all")
         self.assertEqual(status["selected_step_ids"], ["step_a", "step_b", "step_c"])
-        self.assertEqual(self.server.store.read()["schema_version"], 2)
+        self.assertEqual(self.server.store.read()["schema_version"], 3)
         self.server.event(self.event_body(task, "a"))
         self.assertIsNone(self.poll("b"))
 

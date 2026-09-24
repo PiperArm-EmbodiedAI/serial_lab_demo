@@ -38,7 +38,11 @@ class HttpTests(unittest.TestCase):
         self.client.call("POST", "/api/register", dict(identity, config_hash=digest("a"),
             steps=[{"step_id": "a_step", "order": 10}]))
         plan = self.client.call("GET", "/api/plan")
-        self.assertIn("单步测试", opener.open(self.url + "/").read().decode("utf-8"))
+        page = opener.open(self.url + "/").read().decode("utf-8")
+        self.assertIn("单步测试", page)
+        self.assertIn("请求停止当前步骤", page)
+        self.assertIn("人工确认完成并继续", page)
+        self.assertIn("跳过此步骤并继续", page)
         run = self.client.call("POST", "/api/runs", {"plan_version": plan["plan_version"],
             "step_ids": ["a_step"], "mode": "single"})
         path = "/api/runs/" + run["run_id"]
@@ -49,6 +53,10 @@ class HttpTests(unittest.TestCase):
         self.assertIsNone(self.client.call("POST", "/api/poll", identity)["task"])
         self.assertEqual(self.client.call("POST", path + "/resume", {})["status"], "running")
         self.assertIsNotNone(self.client.call("POST", "/api/poll", identity)["task"])
+        stopped = self.client.call("POST", path + "/stop-current", {"note": "test stop"})
+        self.assertEqual(stopped["status"], "stopping")
+        cancel = self.client.call("POST", "/api/poll", dict(identity, busy=True))["task"]
+        self.assertTrue(cancel["cancel_requested"])
         closed = self.client.call("POST", path + "/close", {"physical_checked": True, "note": "mock inspected"})
         self.assertEqual(closed["status"], "closed")
 

@@ -19,6 +19,9 @@
 | POST | `/api/runs/{run_id}/pause` | 立即暂停后续派发（不取消已派发任务） |
 | POST | `/api/runs/{run_id}/pause-after-current` | 当前已派发步骤完成后暂停 |
 | POST | `/api/runs/{run_id}/resume` | 恢复已暂停流程 |
+| POST | `/api/runs/{run_id}/stop-current` | 请求 Node 中断当前子进程（非急停） |
+| POST | `/api/runs/{run_id}/operator-complete` | 人工确认当前失败步骤已完成并继续 |
+| POST | `/api/runs/{run_id}/skip-current` | 人工跳过当前失败步骤并继续 |
 | POST | `/api/runs/{run_id}/close` | 关闭流程记录 |
 | DELETE | `/api/nodes/{node_id}` | 无活动流程时删除离线模块 |
 
@@ -70,7 +73,7 @@ POST `/api/poll`，默认每秒调用一次，心跳租约默认 15 秒：
 
 `previous_results` 按前序 `step_id` 索引。执行前核对配置摘要并持久记录 `task_id`；重复领取同一任务只查询或重报已有结果，不重复执行。
 
-`deadline` 为服务器超时时刻；客户端使用 `expires_in_seconds` 和本地单调时钟判断启动有效期。执行期间及最终事件未获确认前保持 `busy:true`。进程重启遇到未完成记录时上报 `unknown`。
+`deadline` 为服务器超时时刻；客户端使用 `expires_in_seconds` 和本地单调时钟判断启动有效期。执行期间及最终事件未获确认前保持 `busy:true`。进程重启遇到未完成记录时上报 `unknown`。支持停止请求的新版 Agent 会在同一 poll 返回的 task 中读取 `cancel_requested:true`；不支持该字段的旧 Agent 会忽略它，停止不会生效。
 
 ## 3. 上报状态
 
@@ -106,6 +109,10 @@ POST `/api/runs/{run_id}/close`：
 {"physical_checked":true,"note":"动作已结束，设备状态已核实"}
 ```
 
-`pause-after-current` 在有已派发/运行中的任务时将状态设为 `pausing`；当前任务仍可完成，成功后变为 `paused`，失败/未知/超时仍会阻断。若当前任务尚未派发，则立即进入 `paused`。旧 `pause` 仍立即停止待派发任务的领取，但不会取消已经派发的任务。暂停和关闭仅修改调度状态，不停止设备。失败、超时或状态未知时阻断流程；迟到结果不会自动恢复执行。
+`pause-after-current` 在有已派发/运行中的任务时将状态设为 `pausing`；当前任务仍可完成，成功后变为 `paused`，失败/未知/超时仍会阻断。若当前任务尚未派发，则立即进入 `paused`。旧 `pause` 仍立即停止待派发任务的领取，但不会取消已经派发的任务。
+
+`stop-current` 会将运行标为 `stopping` 并在后续 poll 的当前 task 中设置 `cancel_requested:true`。新版 Agent 对命令/函数子进程尝试发送一次 SIGINT（Windows 使用 CTRL_BREAK_EVENT）；不会自动强杀。程序可能忽略信号或无法安全清理硬件。内嵌 handler 无法被强制中断。收到 Agent 最终事件后流程进入暂停或阻断，必须人工核查后处置。旧 Agent 不支持取消，不能假定它已停止。
+
+`operator-complete` 和 `skip-current` 只允许处理 blocked run 当前 failed/unknown 步骤，且要求 `physical_checked:true` 及非空 `note`。前者允许可选 `result` 对象；未提供时后续步骤的 `previous_results` 不包含该 step。后者将步骤标为 skipped，不生成结果。人工处置作为单独审计字段保存，迟到事件不覆盖处置或自动推进。暂停、请求停止和关闭均非设备急停。
 
 服务端 SQLite 状态文档现带 `schema_version`，启动时从旧版未标记状态自动迁移，保留节点注册与历史记录。部署更新时保留相同的 `--state-dir`；GitHub 只更新代码，不迁移数据库。任意可访问主机可运行中央 Server，但同一时刻只应有一个活动 Server；Node 的 `server_url` 必须指向该实例。
